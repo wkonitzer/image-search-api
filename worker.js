@@ -1,5 +1,5 @@
 // worker.mjs — Cloudflare Worker (Modules syntax)
-// Bindings:
+// Bindings (set in Dashboard):
 //   R2 bucket: IMAGES_BUCKET
 //   Secret:    ADMIN_KEY
 
@@ -8,6 +8,7 @@ const DIR_PATH = "/directory";
 const EDGE_HTML_TTL = 300;      // seconds (edge cache)
 const MAX_PAGES_CAP = 5000;     // absolute cap
 const BATCH_PAGES_DEFAULT = 5;  // pages per /admin/build call
+const SWEEP_TICKS = 300;       // ~5h when cron runs every minute
 const SNAPSHOT_KEY = "catalog.json";
 
 // allow plus signs in slugs (e.g., libstdc++)
@@ -32,10 +33,11 @@ export default {
           endpoints: [
             "/v1/status",
             "/v1/images?page=1&size=200",
-            "/v1/search?q=node&size=50",
+            "/v1/search?q=*node*&size=50",
             "POST /admin/build?steps=5",
             "POST /admin/set-lastpage?value=278",
             "POST /admin/restart-crawl",
+            "POST /admin/start-sweep",
             "POST /admin/repair",
             "POST /admin/compact",
             "POST /admin/reset"
@@ -51,7 +53,8 @@ export default {
           complete: snap.complete,
           lastPage: snap.lastPage ?? null,
           lastUpdated: snap.lastUpdated,
-          cronTicks: snap.cronTicks
+          cronTicks: snap.cronTicks,
+          sweepId: snap.sweepId
         });
       }
 
@@ -109,6 +112,18 @@ export default {
         return json({ ok: true, cursor: snap.cursor, complete: snap.complete, lastPage: snap.lastPage ?? null });
       }
 
+      if (pathname === "/admin/start-sweep") {
+        if (request.method !== "POST") return json({ error: "use POST" }, 405);
+        if (!isAdmin(request, env)) return json({ error: "forbidden" }, 403);
+        const snap = await loadSnapshot(env);
+        snap.sweepId = (snap.sweepId || 1) + 1;
+        snap.cursor = 1;
+        snap.complete = false;
+        snap.cronTicks = 0;
+        await saveSnapshot(env, snap);
+        return json({ ok: true, sweepId: snap.sweepId, cursor: snap.cursor, complete: snap.complete });
+      }
+
       if (pathname === "/admin/repair") {
         if (request.method !== "POST") return json({ error: "use POST" }, 405);
         if (!isAdmin(request, env)) return json({ error: "forbidden" }, 403);
@@ -142,27 +157,25 @@ export default {
     }
   },
 
-  // Optional cron — keeps things fresh
+  // Cron — runs every minute; once/day it starts a new sweep
   async scheduled(event, env, ctx) {
     let snap = await loadSnapshot(env);
 
-    // bump counter
     snap.cronTicks = (snap.cronTicks || 0) + 1;
 
-    // if threshold reached (e.g. ~1440 for daily, or 300 for ~5h)
-    if (snap.cronTicks >= 1440) {
+    if (snap.cronTicks >= SWEEP_TICKS) {
+      // begin a new sweep (will eventually prune deletions at completion)
+      snap.cronTicks = 0;
+      snap.sweepId = (snap.sweepId || 1) + 1;
       snap.complete = false;
       snap.cursor = 1;
-      snap.cronTicks = 0;
       await saveSnapshot(env, snap);
     } else {
-      // save counter progress
       await saveSnapshot(env, snap);
     }
 
-    // small crawl batch
     await crawlBatch(env, BATCH_PAGES_DEFAULT);
-  },
+  }
 };
 
 // ---------- Admin auth ----------
@@ -171,14 +184,14 @@ function isAdmin(request, env) {
   return k && env.ADMIN_KEY && k === env.ADMIN_KEY;
 }
 
-// ---------- Crawl ----------
+// ---------- Crawl (adds & stamps slugs for the current sweep) ----------
 async function crawlBatch(env, steps) {
   let snap = await loadSnapshot(env);
 
   const hardStop = Math.min(snap.lastPage || MAX_PAGES_CAP, MAX_PAGES_CAP);
 
   if (snap.complete) {
-    return { ok: true, crawledPages: 0, addedItems: 0, reachedEnd: true, nextCursor: snap.cursor, total: snap.items.length, lastPage: snap.lastPage ?? null };
+    return { ok: true, crawledPages: 0, addedItems: 0, reachedEnd: true, nextCursor: snap.cursor, total: snap.items.length, lastPage: snap.lastPage ?? null, sweepId: snap.sweepId };
   }
 
   let crawledPages = 0;
@@ -202,16 +215,30 @@ async function crawlBatch(env, steps) {
     for (const it of items) {
       const key = it.name;
       if (!snap.seen[key]) {
-        snap.seen[key] = true;
-        snap.items.push(it);
+        snap.items.push(it);    // new slug
         addedItems++;
       }
+      // Stamp "seen in this sweep"
+      snap.seen[key] = snap.sweepId;
     }
 
     page++;
   }
 
   if (snap.lastPage && page > snap.lastPage) snap.complete = true;
+
+  // If the sweep just completed, prune anything not seen this sweep
+  if (snap.complete && snap.sweepPruned !== snap.sweepId) {
+    const keep = new Set();
+    for (const it of snap.items) {
+      if (snap.seen[it.name] === snap.sweepId) keep.add(it.name);
+    }
+    snap.items = snap.items.filter(it => keep.has(it.name));
+    const newSeen = {};
+    for (const name of keep) newSeen[name] = snap.sweepId;
+    snap.seen = newSeen;
+    snap.sweepPruned = snap.sweepId;
+  }
 
   snap.cursor = page;
   snap.items = sortItems(snap.items);
@@ -225,11 +252,12 @@ async function crawlBatch(env, steps) {
     reachedEnd: !!snap.complete,
     nextCursor: snap.cursor,
     total: snap.items.length,
-    lastPage: snap.lastPage ?? null
+    lastPage: snap.lastPage ?? null,
+    sweepId: snap.sweepId
   };
 }
 
-// Single-shape fetch
+// Single-shape fetch (fewer subrequests)
 async function fetchDirectoryPage(n) {
   const u = `${ORIGIN}${DIR_PATH}/${n}`;
   const res = await fetchWithEdgeCache(u);
@@ -238,13 +266,14 @@ async function fetchDirectoryPage(n) {
   return parseCards(html);
 }
 
-// ---------- Snapshot ----------
+// ---------- Snapshot (R2) ----------
 async function loadSnapshot(env) {
   const obj = await env.IMAGES_BUCKET.get(SNAPSHOT_KEY);
   if (obj) {
     const text = await obj.text();
     const snap = JSON.parse(text);
 
+    // Normalize & sanitize
     const items = Array.isArray(snap.items) ? snap.items : [];
     const minimal = [];
     const seen = Object.create(null);
@@ -255,7 +284,8 @@ async function loadSnapshot(env) {
       const candidate = slugFromUrl || slugFromName;
       if (!candidate || !SLUG_RE.test(candidate) || BAD_SLUGS.has(candidate) || seen[candidate]) continue;
       minimal.push({ name: candidate, url: `${ORIGIN}/directory/image/${encodeURIComponent(candidate)}` });
-      seen[candidate] = true;
+      // If legacy 'seen' had booleans/undefined, coerce later; for now just set placeholder.
+      seen[candidate] = Number.isFinite(snap?.seen?.[candidate]) ? snap.seen[candidate] : 0;
     }
 
     snap.items = sortItems(minimal);
@@ -265,6 +295,15 @@ async function loadSnapshot(env) {
     snap.complete = !!snap.complete;
     snap.lastUpdated = snap.lastUpdated || epoch();
     snap.cronTicks = snap.cronTicks || 0;
+    snap.sweepId = snap.sweepId || 1;
+    snap.sweepPruned = snap.sweepPruned || 0;
+
+    // Coerce any boolean 'true' in seen -> 0 (unknown prior sweep)
+    for (const k of Object.keys(snap.seen)) {
+      if (snap.seen[k] === true) snap.seen[k] = 0;
+      if (!Number.isFinite(snap.seen[k])) snap.seen[k] = 0;
+    }
+
     return snap;
   }
 
@@ -280,7 +319,44 @@ async function saveSnapshot(env, snap) {
 }
 
 function freshSnapshot() {
-  return { items: [], seen: {}, cursor: 1, lastPage: null, complete: false, lastUpdated: epoch(), cronTicks: 0 };
+  return {
+    items: [],
+    seen: {},             // slug -> lastSeenSweepId (number)
+    cursor: 1,
+    lastPage: null,
+    complete: false,
+    lastUpdated: epoch(),
+    cronTicks: 0,
+    sweepId: 1,
+    sweepPruned: 0
+  };
+}
+
+// Repair: rebuild from current items using strict rules
+function repairSnapshot(snap) {
+  const minimal = [];
+  const seen = Object.create(null);
+
+  for (const it of snap.items || []) {
+    const slugFromUrl = extractSlugFromUrl(it && it.url);
+    const slugFromName = (it && typeof it.name === "string") ? it.name.toLowerCase() : null;
+    const candidate = slugFromUrl || slugFromName;
+    if (!candidate || !SLUG_RE.test(candidate) || BAD_SLUGS.has(candidate) || seen[candidate]) continue;
+    minimal.push({ name: candidate, url: `${ORIGIN}/directory/image/${encodeURIComponent(candidate)}` });
+    seen[candidate] = Number.isFinite(snap?.seen?.[candidate]) ? snap.seen[candidate] : 0;
+  }
+
+  return {
+    items: sortItems(minimal),
+    seen,
+    cursor: snap.cursor || 1,
+    lastPage: snap.lastPage ?? null,
+    complete: !!snap.complete,
+    lastUpdated: epoch(),
+    cronTicks: snap.cronTicks || 0,
+    sweepId: snap.sweepId || 1,
+    sweepPruned: snap.sweepPruned || 0
+  };
 }
 
 // ---------- Parse ----------
@@ -335,7 +411,7 @@ function sortItems(items) {
 }
 async function fetchWithEdgeCache(url) {
   const cache = caches.default;
-  const req = new Request(url, { headers: { "User-Agent": "images-catalog-builder/r2-slim/1.0" } });
+  const req = new Request(url, { headers: { "User-Agent": "images-catalog-builder/r2-sweep/1.0" } });
   const hit = await cache.match(req);
   if (hit) return hit;
   const res = await fetch(req);
@@ -366,4 +442,3 @@ function corsHeaders() {
     "access-control-allow-headers": "Content-Type, x-admin-key"
   };
 }
-
