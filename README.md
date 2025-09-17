@@ -73,9 +73,104 @@ Returns snapshot status:
 }
 ```
 
-Paginated list of images (sorted alphabetically).
+Paginated list of images
+```
+GET /v1/images
+```
+Returns a paginated list of images sorted alphabetically. Supports both paginated and bulk/all modes.
+
+Query Parameters
+- page (integer ≥ 1) – Page number to return.
+- size (integer 1–1000 or "all") – Number of items per page. Use "all" to fetch the full dataset in one request.
+
+Response Format
+All responses (success or error) follow the same schema:
+```
+{
+  "meta": {
+    "status": "success",        // "success" or "error"
+    "version": "v1",            // API version
+    "schemaVersion": "1.0.0",   // Response schema version
+    "requestId": "uuid",        // Unique request identifier
+    "timestamp": "ISO-8601",    // Server timestamp
+    "durationMs": 12,           // Processing time in ms
+    "cache": "HIT",             // "HIT" or "MISS"
+    "source": "snapshot",       // Data source ("snapshot", "db", "api", etc.)
+    "warnings": [],             // Non-fatal issues, e.g. deprecated params
+    "limits": {                 // Server-side constraints
+      "maxSize": 1000,
+      "maxPages": 1000000000
+    },
+
+    // Pagination metadata
+    "total": 2000,              // Total number of items available
+    "count": 200,               // Number of items returned in this page
+    "remaining": 1800,          // Number of items left after this page
+    "percentComplete": 10,      // Completion relative to total
+    "page": 1,                  // Current page number
+    "size": 200,                // Requested page size
+    "pages": 10,                // Total number of pages
+    "offset": 0,                // Starting index (0-based)
+    "end": 199,                 // Ending index (0-based)
+    "range": "1–200",           // Human-friendly range
+
+    // Navigation helpers
+    "hasPrev": false,
+    "hasNext": true,
+    "prevPage": null,
+    "nextPage": 2,
+    "firstPage": 1,
+    "lastPage": 10,
+
+    // HATEOAS links
+    "links": {
+      "self": "https://.../v1/images?page=1&size=200",
+      "first": "https://.../v1/images?page=1&size=200",
+      "last": "https://.../v1/images?page=10&size=200",
+      "prev": null,
+      "next": "https://.../v1/images?page=2&size=200"
+    }
+  },
+  "items": [ ... ]              // Array of image objects
+}
+```
+
+Example Requests"
+- First page of 200 images
 ```
 GET /v1/images?page=1&size=200
+```
+- Third page of 500 images
+```
+GET /v1/images?page=3&size=500
+```
+- All images in one response
+```
+GET /v1/images?size=all
+```
+
+Error Responses
+Errors share the same schema as success responses, with status: "error" and an HTTP status code:
+```
+{
+  "meta": {
+    "status": "error",
+    "version": "v1",
+    "schemaVersion": "1.0.0",
+    "requestId": "uuid",
+    "timestamp": "ISO-8601",
+    "code": 400,
+    "message": "Invalid 'size' parameter. Must be between 1 and 1000.",
+    "cache": "MISS",
+    "source": "snapshot",
+    "warnings": [],
+    "limits": {
+      "maxSize": 1000,
+      "maxPages": 1000000000
+    }
+  },
+  "items": []
+}
 ```
 
 Search by name:
