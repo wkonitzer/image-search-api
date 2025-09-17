@@ -59,13 +59,202 @@ export default {
       }
 
       if (pathname === "/v1/images") {
-        const page = clampInt(searchParams.get("page"), 1, 1e9, 1);
-        const size = clampInt(searchParams.get("size"), 1, 1000, 200);
-        const snap = await loadSnapshot(env);
-        const itemsSorted = sortItems([...snap.items]);
-        const start = (page - 1) * size;
-        const items = itemsSorted.slice(start, start + size);
-        return json({ items });
+        const requestId = crypto.randomUUID();
+        const apiVersion = "v1";
+        const schemaVersion = "1.0.0"; // independent of API version
+        const startedAt = Date.now();
+      
+        try {
+          const pageParam = searchParams.get("page");
+          const sizeParam = searchParams.get("size");
+      
+          const snap = await loadSnapshot(env);
+          if (!snap) {
+            return errorResponse(requestId, "Snapshot could not be loaded", 500, apiVersion, null, startedAt, "MISS", "snapshot", [], schemaVersion);
+          }
+      
+          const itemsSorted = sortItems([...snap.items]);
+          const total = itemsSorted.length;
+      
+          const cacheStatus = snap.fromCache ? "HIT" : "MISS";
+          const source = "snapshot";
+          const warnings = [];
+      
+          const baseUrl = new URL(request.url);
+          const buildUrl = (page, size) => {
+            const u = new URL(baseUrl);
+            if (size === "all") {
+              u.searchParams.set("size", "all");
+              u.searchParams.delete("page");
+            } else {
+              u.searchParams.set("page", page);
+              u.searchParams.set("size", size);
+            }
+            return u.toString();
+          };
+      
+          const now = new Date().toISOString();
+      
+          if (searchParams.has("limit")) {
+            warnings.push("Query parameter 'limit' is deprecated. Use 'size' instead.");
+          }
+      
+          // Case 1: No page/size → return everything
+          if (!pageParam && !sizeParam) {
+            return json({
+              meta: {
+                status: "success",
+                version: apiVersion,
+                schemaVersion,
+                requestId,
+                timestamp: now,
+                durationMs: Date.now() - startedAt,
+                cache: cacheStatus,
+                source,
+                warnings,
+                limits: {
+                  maxSize: 1000,
+                  maxPages: 1e9
+                },
+                total,
+                count: total,
+                remaining: 0,
+                percentComplete: 100,
+                page: 1,
+                size: total,
+                pages: 1,
+                offset: 0,
+                end: total - 1,
+                range: `1–${total}`,
+                hasPrev: false,
+                hasNext: false,
+                prevPage: null,
+                nextPage: null,
+                firstPage: 1,
+                lastPage: 1,
+                links: {
+                  self: buildUrl(1, "all"),
+                  first: buildUrl(1, "all"),
+                  last: buildUrl(1, "all"),
+                  prev: null,
+                  next: null
+                }
+              },
+              items: itemsSorted
+            });
+          }
+      
+          // Case 2: size=all → return everything (page=1)
+          if (sizeParam === "all") {
+            return json({
+              meta: {
+                status: "success",
+                version: apiVersion,
+                schemaVersion,
+                requestId,
+                timestamp: now,
+                durationMs: Date.now() - startedAt,
+                cache: cacheStatus,
+                source,
+                warnings,
+                limits: {
+                  maxSize: 1000,
+                  maxPages: 1e9
+                },
+                total,
+                count: total,
+                remaining: 0,
+                percentComplete: 100,
+                page: 1,
+                size: total,
+                pages: 1,
+                offset: 0,
+                end: total - 1,
+                range: `1–${total}`,
+                hasPrev: false,
+                hasNext: false,
+                prevPage: null,
+                nextPage: null,
+                firstPage: 1,
+                lastPage: 1,
+                links: {
+                  self: buildUrl(1, "all"),
+                  first: buildUrl(1, "all"),
+                  last: buildUrl(1, "all"),
+                  prev: null,
+                  next: null
+                }
+              },
+              items: itemsSorted
+            });
+          }
+      
+          // Case 3: Normal paginated mode
+          const page = Number.parseInt(pageParam, 10);
+          const size = Number.parseInt(sizeParam, 10);
+      
+          if (Number.isNaN(page) || page < 1) {
+            return errorResponse(requestId, "Invalid 'page' parameter. Must be an integer ≥ 1.", 400, apiVersion, null, startedAt, cacheStatus, source, warnings, schemaVersion);
+          }
+          if (Number.isNaN(size) || size < 1 || size > 1000) {
+            return errorResponse(requestId, "Invalid 'size' parameter. Must be between 1 and 1000.", 400, apiVersion, null, startedAt, cacheStatus, source, warnings, schemaVersion);
+          }
+      
+          const pages = Math.max(1, Math.ceil(total / size));
+          if (page > pages) {
+            return errorResponse(requestId, `Page ${page} is out of range. Last page is ${pages}.`, 400, apiVersion, null, startedAt, cacheStatus, source, warnings, schemaVersion);
+          }
+      
+          const start = (page - 1) * size;
+          const items = itemsSorted.slice(start, start + size);
+          const end = start + items.length - 1;
+          const remaining = total - (end + 1);
+          const percentComplete = Math.min(100, Math.round(((end + 1) / total) * 100));
+      
+          return json({
+            meta: {
+              status: "success",
+              version: apiVersion,
+              schemaVersion,
+              requestId,
+              timestamp: now,
+              durationMs: Date.now() - startedAt,
+              cache: cacheStatus,
+              source,
+              warnings,
+              limits: {
+                maxSize: 1000,
+                maxPages: 1e9
+              },
+              total,
+              count: items.length,
+              remaining,
+              percentComplete,
+              page,
+              size,
+              pages,
+              offset: start,
+              end,
+              range: `${start + 1}–${end + 1}`,
+              hasPrev: page > 1,
+              hasNext: page < pages,
+              prevPage: page > 1 ? page - 1 : null,
+              nextPage: page < pages ? page + 1 : null,
+              firstPage: 1,
+              lastPage: pages,
+              links: {
+                self: buildUrl(page, size),
+                first: buildUrl(1, size),
+                last: buildUrl(pages, size),
+                prev: page > 1 ? buildUrl(page - 1, size) : null,
+                next: page < pages ? buildUrl(page + 1, size) : null
+              }
+            },
+            items
+          });
+        } catch (err) {
+          return errorResponse(requestId, err.message || "Unexpected server error", 500, apiVersion, err, startedAt, "MISS", "snapshot", [], schemaVersion);
+        }
       }
 
       if (pathname === "/v1/search") {
@@ -441,4 +630,50 @@ function corsHeaders() {
     "access-control-allow-methods": "GET, POST, OPTIONS",
     "access-control-allow-headers": "Content-Type, x-admin-key"
   };
+}
+
+// Utility: standard error response
+function errorResponse(
+  requestId,
+  message,
+  code = 400,
+  apiVersion = "v1",
+  err = null,
+  startedAt = null,
+  cache = "MISS",
+  source = "unknown",
+  warnings = [],
+  schemaVersion = "1.0.0"
+) {
+  const durationMs = startedAt ? Date.now() - startedAt : null;
+
+  const base = {
+    meta: {
+      status: "error",
+      version: apiVersion,
+      schemaVersion,
+      requestId,
+      timestamp: new Date().toISOString(),
+      code,
+      message,
+      cache,
+      source,
+      warnings,
+      limits: {
+        maxSize: 1000,
+        maxPages: 1e9
+      },
+      ...(durationMs !== null ? { durationMs } : {})
+    },
+    items: []
+  };
+
+  if (process.env.NODE_ENV === "development" && err) {
+    base.meta.debug = {
+      stack: err.stack,
+      name: err.name
+    };
+  }
+
+  return json(base, { status: code });
 }
